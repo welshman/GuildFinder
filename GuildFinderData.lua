@@ -404,10 +404,13 @@ function Data.AddChatListing(text, sender)
   text = text:gsub("|H.-|h(.-)|h", "%1"):gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
   if #text < 15 or #text > 255 then return end
   local t = lower(text)
-  local recruit = t:find("recruit", 1, true) or t:find("join us", 1, true) or t:find("new members", 1, true)
-  local guildy = t:find("guild", 1, true) or text:find("<[^>]+>")
-  if not (recruit and guildy) then return end
-  if Data.IsSpam(text) then return end
+  local hasTag = text:find("<[^>]+>") ~= nil
+  local guildy = hasTag or t:find("guild", 1, true)
+  local recruit = t:find("recruit", 1, true) or t:find("join", 1, true)
+    or t:find("looking for", 1, true) or t:find("lfm", 1, true) or t:find("lf ", 1, true)
+    or t:find("members", 1, true) or t:find("seeking", 1, true)
+    or (hasTag and (t:find("raid", 1, true) or t:find("casual", 1, true) or t:find("social", 1, true) or t:find("level", 1, true)))
+  if not (recruit and guildy) then return end  if Data.IsSpam(text) then return end
   sender = Ambiguate and Ambiguate(sender, "none") or sender
   sender = sender:gsub("%-.*$", "")
   if sender == "" or sender == GF.me then return end
