@@ -2,7 +2,7 @@
 ## Title: Guild Finder
 ## Notes: Two-sided guild / member recruitment board with whisper contact and peer-to-peer sync (WoW Forever).
 ## Author: Welshdroo
-## Version: 1.4.0
+## Version: 1.4.1
 ## SavedVariables: GuildFinderDB
 ## IconTexture: Interface\AddOns\GuildFinder\GuildFinderIcon
 ## Category: Social
