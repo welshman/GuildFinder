@@ -5,7 +5,7 @@ local Data = GF.Data
 local PREFIX, PROTO = GF.PREFIX, GF.PROTO
 local lower = string.lower
 
-S.queue, S.peers, S.buckets, S.chunks = {}, {}, {}, {}
+S.queue, S.peers, S.chanOK, S.buckets, S.chunks, S.respondAt = {}, {}, {}, {}, {}, {}
 S.stats = { sent = 0, recv = 0, rejected = 0 }
 S.chanFails = 0
 local SendFn
@@ -51,7 +51,7 @@ function S.Decode(text, mode)
   return Data.Validate(raw, mode or "net")
 end
 
----------------------------------------------------------------- The sync channel (the ONLY transport)
+---------------------------------------------------------------- Sync channels & fallback
 function S.ChannelName() return "GFSync" .. (GF.myFaction or "") end
 
 function S.ChannelId()
@@ -61,10 +61,17 @@ function S.ChannelId()
   return nil
 end
 
-function S.Channels() -- kept for the UI tooltip
+function S.Channels()
+  local s, list = GF.db.settings, {}
   local id = S.ChannelId()
-  if id then return { { "CHANNEL", id } } end
-  return {}
+  if id and S.chanOK.CHANNEL ~= false then list[#list + 1] = { "CHANNEL", id } end
+  if s.useGuildGroup ~= false then
+    if IsInGuild and IsInGuild() and S.chanOK.GUILD ~= false then list[#list + 1] = { "GUILD" } end
+    if IsInRaid and IsInRaid() and S.chanOK.RAID ~= false then list[#list + 1] = { "RAID" }
+    elseif IsInGroup and IsInGroup(LE_PARTY_CATEGORY_INSTANCE or 2) and S.chanOK.INSTANCE_CHAT ~= false then list[#list + 1] = { "INSTANCE_CHAT" }
+    elseif IsInGroup and IsInGroup() and S.chanOK.PARTY ~= false then list[#list + 1] = { "PARTY" } end
+  end
+  return list
 end
 
 function S.HideChannel()
@@ -77,6 +84,8 @@ end
 
 function S.JoinChannel(force)
   if not (GF.db and GF.db.settings.syncEnabled) then return end
+  if S.chanOK.CHANNEL == false and not force then return end
+  if force then S.chanOK.CHANNEL = nil end
   local now = GetTime()
   if not force and S.lastJoin and now - S.lastJoin < 20 then return end
   S.lastJoin = now
@@ -101,19 +110,19 @@ function S.JoinChannel(force)
 end
 
 ---------------------------------------------------------------- Outgoing queue
-function S.Enqueue(text)
+function S.Enqueue(chan, target, text)
   if #S.queue >= 200 then table.remove(S.queue, 1) end
-  S.queue[#S.queue + 1] = { text = text, tries = 0 }
+  S.queue[#S.queue + 1] = { chan = chan, target = target, text = text, tries = 0 }
 end
 
-function S.Send(text)
-  if #text <= 230 then return S.Enqueue(text) end
+function S.Send(chan, target, text)
+  if #text <= 230 then return S.Enqueue(chan, target, text) end
   local n = math.ceil(#text / 200)
   if n > 12 then return end
   S.msgCounter = ((S.msgCounter or 0) + 1) % 4096
   local mid = string.format("%x%02x", S.msgCounter, math.random(0, 255))
   for i = 1, n do
-    S.Enqueue(("C~%s~%d~%d~%s"):format(mid, i, n, text:sub((i - 1) * 200 + 1, i * 200)))
+    S.Enqueue(chan, target, ("C~%s~%d~%d~%s"):format(mid, i, n, text:sub((i - 1) * 200 + 1, i * 200)))
   end
 end
 
@@ -122,40 +131,51 @@ local function Pump()
   if #q == 0 or not GF.db or not GF.db.settings.syncEnabled or not SendFn then return end
   if S.nextSend and GetTime() < S.nextSend then return end
   if C_ChatInfo and C_ChatInfo.InChatMessagingLockdown and C_ChatInfo.InChatMessagingLockdown() then return end
-  local id = S.ChannelId()
-  if not id then S.nextSend = GetTime() + 5; S.JoinChannel() return end
   local it = q[1]
-  local ok, res = pcall(SendFn, PREFIX, it.text, "CHANNEL", id)
+  if it.chan == "CHANNEL" and not S.ChannelId() then
+    table.remove(q, 1)
+    S.JoinChannel()
+    return
+  end
+  local ok, res = pcall(SendFn, PREFIX, it.text, it.chan, it.target)
   local code = 0
   if not ok then code, S.stats.lastError, S.stats.lastErrorT = 9, tostring(res), GetTime()
   elseif type(res) == "number" then code = res
   elseif res == false then code = 9 end
   if code == 0 then
     table.remove(q, 1)
-    S.chanFails = 0
+    if it.chan == "CHANNEL" then S.chanFails = 0 end
     S.stats.sent, S.stats.lastSend, S.stats.lastError = S.stats.sent + 1, GetTime(), nil
   elseif code == 3 or code == 8 or code == 10 or code == 11 then -- throttled / lockdown: retry later
     it.tries = it.tries + 1
     if it.tries > 5 then table.remove(q, 1) end
     S.nextSend = GetTime() + (code == 11 and 5 or 2)
-  elseif code == 7 then -- InvalidChannel: the client refuses addon messages on this channel
-    S.chanFails = S.chanFails + 1
-    S.stats.lastError = "The game rejected addon messages on the sync channel (InvalidChannel). Syncing is unavailable on this client build."
+  elseif code == 7 then -- InvalidChannel: disable this channel for the session and keep other transports running
+    S.chanOK[it.chan] = false
+    if it.chan == "CHANNEL" then
+      S.chanFails = S.chanFails + 1
+      S.stats.lastError = "Custom channel rejected (InvalidChannel); using guild/group/whisper fallback."
+    else
+      S.stats.lastError = "Channel " .. tostring(it.chan) .. " rejected (InvalidChannel)."
+    end
     S.stats.lastErrorT = GetTime()
-    for i = #q, 1, -1 do q[i] = nil end
-    S.nextSend = GetTime() + math.min(60 * S.chanFails, 600)
-    GF.Debug("InvalidChannel from SendAddonMessage; backing off", S.chanFails)
+    for i = #q, 1, -1 do if q[i].chan == it.chan then table.remove(q, i) end end
+    GF.Debug("InvalidChannel from SendAddonMessage on", it.chan)
   else
     table.remove(q, 1)
     S.stats.lastError = "SendAddonMessage result " .. tostring(RESULT[code] or code)
     S.stats.lastErrorT = GetTime()
-    GF.Debug("send failed", RESULT[code] or code)
+    GF.Debug("send failed", RESULT[code] or code, it.chan)
   end
 end
 
 function S.Broadcast(text)
   if not GF.db.settings.syncEnabled then return end
-  S.Send(text)
+  for _, c in ipairs(S.Channels()) do S.Send(c[1], c[2], text) end
+  local n, now = 0, GetTime()
+  for name, p in pairs(S.peers) do
+    if now - p.t < 1800 and n < 8 then S.Send("WHISPER", name, text); n = n + 1 end
+  end
 end
 function S.Publish(l) S.Broadcast(S.Encode(l)) end
 function S.PublishDelete(l) S.Broadcast(("X~%d~%s~%d"):format(PROTO, l.id, l.ver + 1)) end
@@ -165,7 +185,7 @@ function S.Request(manual)
   local now = GetTime()
   if manual and S.lastReq and now - S.lastReq < 15 then return false, "Please wait a few seconds between refreshes." end
   S.lastReq = now
-  if not S.ChannelId() then S.JoinChannel(true) end
+  if not S.ChannelId() and S.chanOK.CHANNEL ~= false then S.JoinChannel(manual) end
   local since = manual and 0 or math.max(0, (GF.db.lastUpdate or 0) - 3600)
   S.Broadcast(("Q~%d~%d"):format(PROTO, since))
   return true
@@ -177,23 +197,20 @@ local function SenderIsAuthor(sender, l)
   return s == lower(l.author) or s == lower(l.author .. "-" .. Data.Norm(l.arealm))
 end
 
--- Answers a request on the channel. Own listings always; a few cached ones sometimes (keeps channel traffic low).
--- Listings read from chat are unverified and never passed on.
-local function Respond(since)
+-- Answers a request via WHISPER to the requester with a per-sender cooldown.
+local function Respond(sender, since)
   local now = GetTime()
-  if S.lastRespond and now - S.lastRespond < 30 then return end
-  S.lastRespond = now
+  if S.respondAt[sender] and now - S.respondAt[sender] < 30 then return end
+  S.respondAt[sender] = now
   local mine, other, ts = {}, {}, time()
   for _, l in pairs(GF.db.listings) do
     if l.updated > since and l.expires > ts and not Data.IsBlocked(l) and not Data.IsChat(l) then
       if Data.IsMine(l) then mine[#mine + 1] = l else other[#other + 1] = l end
     end
   end
-  for _, l in ipairs(mine) do S.Send(S.Encode(l)) end
-  if math.random() < 0.25 then
-    table.sort(other, function(a, b) return a.updated > b.updated end)
-    for i = 1, math.min(8, #other) do S.Send(S.Encode(other[i])) end
-  end
+  for _, l in ipairs(mine) do S.Send("WHISPER", sender, S.Encode(l)) end
+  table.sort(other, function(a, b) return a.updated > b.updated end)
+  for i = 1, math.min(10, #other) do S.Send("WHISPER", sender, S.Encode(other[i])) end
 end
 
 local function Dispatch(text, sender)
@@ -220,7 +237,7 @@ local function Dispatch(text, sender)
     local parts = Split(text, "~", 5)
     local proto, since = tonumber(parts[2]), tonumber(parts[3]) or 0
     if not proto or proto < PROTO then return end
-    C_Timer.After(1 + math.random() * 4, function() Respond(since) end)
+    C_Timer.After(0.5 + math.random() * 2.5, function() Respond(sender, since) end)
   end
 end
 
@@ -228,7 +245,6 @@ function S.OnMessage(prefix, text, channel, sender)
   if prefix ~= PREFIX or type(text) ~= "string" or type(sender) ~= "string" then return end
   if #text > 255 or #text < 3 then return end
   if not GF.db or not GF.db.settings.syncEnabled then return end
-  if channel ~= "CHANNEL" then GF.Debug("ignored message from", tostring(channel)) return end -- channel-only
   sender = Ambiguate and Ambiguate(sender, "none") or sender
   if lower(sender) == lower(GF.me or "") then return end
   local now = GetTime()
@@ -243,7 +259,7 @@ function S.OnMessage(prefix, text, channel, sender)
   if b.n > 60 then S.stats.rejected = S.stats.rejected + 1; return end
   local pc = 0
   for _ in pairs(S.peers) do pc = pc + 1 end
-  if pc < 200 or S.peers[sender] then S.peers[sender] = { t = now } end
+  if pc < 200 or S.peers[sender] then S.peers[sender] = { t = now, via = channel } end
 
   if text:sub(1, 2) == "C~" then
     local mid, i, n, part = text:match("^C~(%x+)~(%d+)~(%d+)~(.*)$")
@@ -276,10 +292,10 @@ function S.Status()
   if not s.syncEnabled then return "off", "Sync is turned off", 0 end
   local now, peers = GetTime(), 0
   for _, p in pairs(S.peers) do if now - p.t < 1800 then peers = peers + 1 end end
-  if S.chanFails > 0 and S.stats.lastErrorT and now - S.stats.lastErrorT < 900 then
+  if S.chanFails > 0 and S.stats.lastErrorT and now - S.stats.lastErrorT < 900 and #S.Channels() == 0 then
     return "error", S.stats.lastError, peers
   end
-  if not S.ChannelId() then return "idle", "Joining the sync channel...", peers end
+  if #S.Channels() == 0 and peers == 0 then return "idle", "Joining sync / waiting for guild or group", peers end
   if peers > 0 then
     return "ok", (peers == 1 and "1 other user online" or (peers .. " other users online")), peers
   end
@@ -289,7 +305,10 @@ end
 function S.Diag()
   local out = {}
   local id = S.ChannelId()
-  out[#out + 1] = ("Channel: %s  id=%s"):format(S.ChannelName(), tostring(id))
+  out[#out + 1] = ("Channel: %s  id=%s  (CHANNEL_OK=%s)"):format(S.ChannelName(), tostring(id), tostring(S.chanOK.CHANNEL ~= false))
+  local chans = {}
+  for _, c in ipairs(S.Channels()) do chans[#chans + 1] = c[1] end
+  out[#out + 1] = "Active transports: " .. (#chans > 0 and table.concat(chans, ", ") or "none")
   local restricted = C_ChatInfo and C_ChatInfo.AreOutgoingAddonChatMessagesRestricted
     and C_ChatInfo.AreOutgoingAddonChatMessagesRestricted()
   out[#out + 1] = "AreOutgoingAddonChatMessagesRestricted: " .. tostring(restricted)
@@ -297,9 +316,9 @@ function S.Diag()
   out[#out + 1] = "InChatMessagingLockdown: " .. tostring(lock)
   if id and SendFn then
     local ok, res = pcall(SendFn, PREFIX, "T~1", "CHANNEL", id)
-    out[#out + 1] = "Test send: " .. (ok and (res == nil and "nil (no result returned)" or tostring(RESULT[res] or res)) or ("error: " .. tostring(res)))
+    out[#out + 1] = "Test send (CHANNEL): " .. (ok and (res == nil and "nil (no result returned)" or tostring(RESULT[res] or res)) or ("error: " .. tostring(res)))
   else
-    out[#out + 1] = "Test send: skipped (not joined to the channel)"
+    out[#out + 1] = "Test send (CHANNEL): skipped (not joined)"
   end
   out[#out + 1] = ("Queue: %d  Sent: %d  Received: %d  Rejected: %d"):format(#S.queue, S.stats.sent, S.stats.recv, S.stats.rejected)
   return out
@@ -337,11 +356,11 @@ function S.Init()
     for k, v in pairs(S.chunks) do if now - v.t > 30 then S.chunks[k] = nil end end
     for k, v in pairs(S.peers) do if now - v.t > 3600 then S.peers[k] = nil end end
   end)
-  C_Timer.NewTicker(60, function() -- keep the sync channel joined
-    if GF.db.settings.syncEnabled and not S.ChannelId() then S.JoinChannel() end
+  C_Timer.NewTicker(60, function()
+    if GF.db.settings.syncEnabled and S.chanOK.CHANNEL ~= false and not S.ChannelId() then S.JoinChannel() end
   end)
   C_Timer.NewTicker(300, function() Data.Cleanup(); if GF.UI and GF.UI.RequestRefresh then GF.UI.RequestRefresh() end end)
-  C_Timer.NewTicker(900, function() -- periodic re-announce of own active adverts
+  C_Timer.NewTicker(900, function()
     for _, kind in ipairs({ "G", "P" }) do
       local l = Data.MyAd(kind)
       if l then S.Publish(l) end
